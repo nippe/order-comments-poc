@@ -1,0 +1,26 @@
+type Comment {
+  orderNumber: String!
+  author: String!
+  comment: String!
+  created: Int! # date
+  uniqueId: String!
+}
+
+type PaginatedComments {
+  comments: [Comment!]!
+  nextToken: String
+}
+
+type Query {
+  allCommentsByOrder(orderNumber: String!, count: Int, nextToken: String): PaginatedComments!
+}
+
+type Mutation {
+  addComment(orderNumber: String!, author: String!, comment: String!): Comment
+  deleteComment(orderNumber: String!, author: String!, created: Int!, uniqueId: String!): Comment
+}
+
+schema {
+  query: Query
+  mutation: Mutation
+}

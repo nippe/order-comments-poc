@@ -1,0 +1,218 @@
+# This is the SAM template that represents the architecture of your serverless application
+# https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-template-basics.html
+
+# The AWSTemplateFormatVersion identifies the capabilities of the template
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/format-version-structure.html
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  OrderControl Comments PoC
+
+# Transform section specifies one or more macros that AWS CloudFormation uses to process your template
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/transform-section-structure.html
+Transform:
+  - AWS::Serverless-2016-10-31
+
+# Resources declares the AWS resources that you want to include in the stack
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/resources-section-structure.html
+Resources:
+  # Each Lambda function is defined by properties:
+  # https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+
+  CommentsGraphQlApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      AuthenticationType: API_KEY
+      Name: !Sub ${AWS::StackName}
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt CommentsAppSyncServiceRole.Arn
+        FieldLogLevel: "ALL"
+      XrayEnabled: true
+
+  ApiKey:
+    Type: AWS::AppSync::ApiKey
+    Properties:
+      ApiId: !GetAtt CommentsGraphQlApi.ApiId
+      Expires: 1630364400
+
+  CommentsAppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppSyncPushToCloudWatchLogs
+      Policies:
+        - PolicyName: DynamoDbCrudAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:PutItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:DescribeTable
+                  - dynamodb:ConditionCheckItem
+                Resource: !GetAtt OcEventsDynamoTable.Arn
+
+  CommentsDynamoDBTableDataSource:
+    Type: "AWS::AppSync::DataSource"
+    Properties:
+      ApiId: !GetAtt CommentsGraphQlApi.ApiId
+      Name: CommentsDynamoDBTable
+      Description: Datasorurce for table containg events and comments
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt CommentsAppSyncServiceRole.Arn
+      DynamoDBConfig:
+        AwsRegion: "eu-west-1"
+        TableName: !Ref OcEventsDynamoTable
+
+  QueryGetCommentsResolver:
+    Type: "AWS::AppSync::Resolver"
+    DependsOn: Schema
+    Properties:
+      ApiId: !GetAtt CommentsGraphQlApi.ApiId
+      TypeName: Query
+      FieldName: allCommentsByOrder
+      DataSourceName: !GetAtt CommentsDynamoDBTableDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version" : "2017-02-28",
+          "operation" : "Query",
+          "query" : {
+              "expression" : "#pk = :orderNumber AND begins_with(#sk, :commentPrefix)",
+              "expressionNames" : {
+                  "#pk": "pk",
+                  "#sk": "sk"
+              },
+              "expressionValues" : {
+                  ":orderNumber" : {"S": "ORDER#${context.arguments.orderNumber}"},
+                  ":commentPrefix": {"S": "COMMENT#"}
+              }
+          },
+          "limit" : 10,
+          "scanIndexForward" : false,
+          "consistentRead" : false,
+        }
+      ResponseMappingTemplate: |
+        {
+          "comments": $utils.toJson($context.result.items),
+          #if( ${context.result.nextToken} )
+            "nextToken": "${context.result.nextToken}",
+          #end
+        }
+
+  MutaionAddCommentsResolver:
+    Type: "AWS::AppSync::Resolver"
+    DependsOn: Schema
+    Properties:
+      ApiId: !GetAtt CommentsGraphQlApi.ApiId
+      TypeName: Mutation
+      FieldName: addComment
+      DataSourceName: !GetAtt CommentsDynamoDBTableDataSource.Name
+      RequestMappingTemplate: |
+        #set( $d = $util.dynamodb )
+        #set( $values = $d.toMapValues($context.arguments) )
+        #set( $now = $util.time.nowEpochSeconds() )
+        #set( $expires = $now + 70956000 )
+        $!{values.put("created", $d.toDynamoDB($now))}
+        $!{values.put("expires", $d.toDynamoDB($expires))}
+        $!{values.put("uniqueId", $d.toDynamoDB($util.autoId()))}
+        {
+          "version" : "2017-02-28",
+          "operation" : "PutItem",
+          "key": {
+            "pk": {"S": "ORDER#${context.arguments.orderNumber}"},
+            "sk": {"S": "COMMENT#${now}"},
+          },
+          "attributeValues": $util.toJson($values),
+        }
+      ResponseMappingTemplate: |
+        $utils.toJson($context.result)
+
+  MutaionDeleteCommentsResolver:
+    Type: "AWS::AppSync::Resolver"
+    DependsOn: Schema
+    Properties:
+      ApiId: !GetAtt CommentsGraphQlApi.ApiId
+      TypeName: Mutation
+      FieldName: deleteComment
+      DataSourceName: !GetAtt CommentsDynamoDBTableDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version" : "2017-02-28",
+          "operation" : "DeleteItem",
+          "key": {
+            "pk": {"S": "ORDER#${context.arguments.orderNumber}"},
+            "sk": {"S": "COMMENT#${ctx.args.created}"}
+          },
+          "condition" : {
+            "expression": "uniqueId = :uniqueId",
+            "expressionValues" : {
+                ":uniqueId" : $util.dynamodb.toDynamoDBJson($ctx.args.uniqueId)
+            }
+          }
+        }
+      ResponseMappingTemplate: |
+        $utils.toJson($context.result)
+
+  Schema:
+    Type: "AWS::AppSync::GraphQLSchema"
+    Properties:
+      ApiId: !GetAtt CommentsGraphQlApi.ApiId
+      DefinitionS3Location: schema.graphql
+
+  # DynamoDb Table for storing events (comments are an event)
+  OcEventsDynamoTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      TableName: !Sub ${AWS::StackName}-events
+      BillingMode: PAY_PER_REQUEST
+
+      AttributeDefinitions:
+        - AttributeName: "pk"
+          AttributeType: S
+        - AttributeName: "sk"
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: "pk"
+          KeyType: "HASH"
+        - AttributeName: "sk"
+          KeyType: "RANGE"
+
+      TimeToLiveSpecification:
+        AttributeName: expires
+        Enabled: true
+
+Outputs:
+  GraphQLApiARN:
+    Description: The App ID of the GraphQL endpoint.
+    Value: !Ref CommentsGraphQlApi
+  GraphQLApiId:
+    Description: The App ID of the GraphQL endpoint.
+    Value: !GetAtt CommentsGraphQlApi.ApiId
+  GraphQLApiEndpoint:
+    Description: The URL for the GraphQL endpoint.
+    Value: !GetAtt CommentsGraphQlApi.GraphQLUrl
+  GraphQLApiKey:
+    Description: The API KEY for the GraphQL API
+    Value: !GetAtt ApiKey.ApiKey
+  # PostDynamoDBTableDataSourceARN:
+  #   Description: The ARN for the Post DynamoDB table DataSource.
+  #   Value: !Ref PostDynamoDBTableDataSource
+  # PostDynamoDBTableDataSourceName:
+  #   Description: The ARN for the Post DynamoDB table DataSource.
+  #   Value: !GetAtt PostDynamoDBTableDataSource.Name
